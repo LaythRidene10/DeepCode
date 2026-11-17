@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ import uuid
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+
+from history import DB_NAME, TITLE_MAX, HistoryStore, rel_time
 
 # --------------------------------------------------------------------------
 # Tunables
@@ -798,7 +801,7 @@ class UI:
     def spec(self, label: str, value: str) -> str:
         return self.gray(label.ljust(9)) + "  " + self.strong(value)
 
-    def banner(self, cfg, session_path: Path) -> None:
+    def banner(self, cfg, db_path: Path | None) -> None:
         stamp = datetime.now().strftime("%Y-%m-%d · %H:%M")
         threads = f"{cfg.threads} threads" if cfg.threads else "auto threads"
         info = [
@@ -810,7 +813,7 @@ class UI:
             self.spec("API", shorten_left(str(cfg.api), 46)),
             self.spec("WORKSPACE", shorten_left(str(cfg.workspace), 46)),
             self.spec("SESSION", stamp),
-            self.spec("LOG", shorten_left(str(session_path), 46)),
+            self.spec("HISTORY", shorten_left(str(db_path), 46) if db_path else "not saved"),
         ]
         logo = [self._paint(row.ljust(LOGO_WIDTH), LOGO_STYLES[i]) for i, row in enumerate(LOGO)]
         if self.width >= 78:
@@ -828,6 +831,7 @@ class UI:
         self.out(
             "  " + self.gray("Type a request.") + "  "
             + self.strong("/new") + self.gray(" resets.") + "  "
+            + self.strong("/history") + self.gray(" past chats.") + "  "
             + self.strong("/exit") + self.gray(" quits.") + "  "
             + self.strong("Ctrl+C") + self.gray(" aborts.")
         )
@@ -902,7 +906,7 @@ class UI:
         for line in lines[:max(0, cap)]:
             self.out(("    │ " + paint(line)) if line else "    │")
         if len(lines) > cap:
-            self.out("    │ " + self.gray(f"… +{len(lines) - cap} lines · full output in session log"))
+            self.out("    │ " + self.gray(f"… +{len(lines) - cap} lines · full output in chat history"))
 
     def result(self, observation: str, error: bool = False) -> None:
         lines = self._lines(observation)
@@ -937,10 +941,59 @@ class UI:
     def help(self) -> None:
         self.out()
         self.out("  " + self.gray("COMMANDS"))
-        self.out("  " + self.strong("/new") + self.gray("    start a fresh conversation"))
-        self.out("  " + self.strong("/exit") + self.gray("   quit (or /quit)"))
-        self.out("  " + self.strong("/help") + self.gray("   this list"))
+        self.out("  " + self.strong("/new") + self.gray("             start a fresh chat (the old one stays saved)"))
+        self.out("  " + self.strong("/history [N|all]") + self.gray("  list recent chats"))
+        self.out("  " + self.strong("/resume [N]") + self.gray("       reopen a chat from the list"))
+        self.out("  " + self.strong("/rename TITLE") + self.gray("     rename the current chat"))
+        self.out("  " + self.strong("/delete N") + self.gray("         delete a chat from the list"))
+        self.out("  " + self.strong("/exit") + self.gray("             quit (or /quit)"))
+        self.out("  " + self.strong("/help") + self.gray("             this list"))
         self.out()
+
+    def history(self, rows: list[dict], current: int | None = None,
+                hints: tuple[tuple[str, str], ...] = (("/resume N", "open"), ("/delete N", "remove"))) -> None:
+        self.out()
+        if not rows:
+            self.out("  " + self.gray("No saved chats yet."))
+            self.out()
+            return
+        self.out("  " + self.gray("RECENT CHATS"))
+        for index, row in enumerate(rows, 1):
+            turns = int(row.get("turns") or 0)
+            right = self.gray(f"{turns} turn{'s' if turns != 1 else ''} · {rel_time(row.get('updated_at'))}")
+            mark = self.blue("●") if row["id"] == current else " "
+            room = max(10, self.width - 2 - 5 - visible_len(right) - 2)
+            left = mark + self.gray(f"{index:>2}") + "  " + self.strong(ellipsize(row.get("title") or "Untitled chat", room))
+            self.out(self.row(left, right))
+            if row.get("workspace"):
+                self.out("      " + self.gray(shorten_left(row["workspace"], self.width - 8)))
+        self.out()
+        if hints:
+            self.out("  " + "   ".join(self.strong(cmd) + " " + self.gray(text) for cmd, text in hints))
+            self.out()
+
+    def recap(self, title: str, messages: list[dict], when: str = "") -> None:
+        bits = [f"{len(messages)} messages"]
+        if when:
+            bits.append(when)
+        right = self.gray(" · ".join(bits))
+        room = max(10, self.width - 2 - 10 - visible_len(right) - 2)
+        self.out()
+        self.out(self.row(self.blue("↺ RESUMED") + " " + self.strong(ellipsize(title, room)), right))
+        last_user = None
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].get("role") == "user":
+                last_user = index
+                break
+        if last_user is None:
+            return
+        self.out("  " + self.gray("YOU") + " " + self.blue("›") + " "
+                 + ellipsize(one_line(messages[last_user].get("content")), max(10, self.width - 10)))
+        for message in reversed(messages[last_user + 1:]):
+            text = str(message.get("content") or "")
+            if message.get("role") == "assistant" and text.strip() and not message.get("tool_calls"):
+                self.note("LAST REPLY", text, self.gray)
+                break
 
     def done(self, summary: str, seconds: float, steps: int, tokens: int,
              rate: float = 0.0, load: float = 0.0, gap: bool = True) -> None:
@@ -1170,98 +1223,114 @@ class Harness:
         self.todo: list[dict] = []
         self.repeat_key: str | None = None
         self.repeat_count = 0
-        self.session_path: Path | None = None
-        self.log_fh = None
+        self.session_id: int | None = None   # created lazily on the first saved message
+        self._listing: list[int] = []        # chat ids behind the last /history numbering
         self._ps_shown = False
+        self._db_warned = False
         self.system_prompt = build_system_prompt(cfg)
         # ~2.8 chars/token measured on code and JSON; keep room for the answer too.
         reserve = min(cfg.max_predict, 1024)
         self.history_budget = max(1500, int((cfg.ctx - reserve) * 2.8)
                                   - len(json.dumps(TOOL_SCHEMAS)))
         self.tool_chars = min(MAX_TOOL_CHARS, max(1500, int(cfg.ctx * 0.75)))
-        self._open_log(cfg.resume)
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0] = {"role": "system", "content": self.system_prompt}
-        else:
-            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
-
-    def _open_log(self, resume) -> None:
-        directory = Path(self.cfg.session_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-        if resume:
-            path = None
-            loaded: list[dict] = []
-            if resume == "latest":
-                # Newest log can be an empty session from /new; skip to the newest with messages.
-                files = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-                for candidate in files:
-                    loaded = drop_incomplete_tail(self._read_messages(candidate))
-                    if loaded:
-                        path = candidate
-                        break
-                if files and not path:
-                    self.ui.warn("no session with messages to resume; starting a new session")
-            else:
-                path = Path(str(resume)).expanduser()
-                if path.is_file():
-                    loaded = drop_incomplete_tail(self._read_messages(path))
-                    if not loaded:
-                        self.ui.warn(f"no usable messages in {path}; starting a new session")
-                else:
-                    self.ui.warn(f"resume target not found: {path or resume}; starting a new session")
-            if path and loaded:
-                self.session_path = path
-                self.log_fh = open(path, "a", encoding="utf-8")
-                self.messages = loaded
-                self.log("resumed", messages=len(loaded))
-                self.ui.meta(f"resumed {len(loaded)} messages from {shorten_left(str(path), 60)}")
-                return
-
-        stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        self.session_path = directory / (stamp + ".jsonl")
-        serial = 1
-        while self.session_path.exists():
-            serial += 1
-            self.session_path = directory / f"{stamp}-{serial}.jsonl"
-        self.log_fh = open(self.session_path, "a", encoding="utf-8")
-        self.log("start", model=self.cfg.model, api=self.cfg.api, backend=self.cfg.backend,
-                 workspace=str(self.cfg.workspace), threads=self.cfg.threads, ctx=self.cfg.ctx)
-
-    @staticmethod
-    def _read_messages(path: Path) -> list[dict]:
-        messages: list[dict] = []
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return messages
-        for line in text.splitlines():
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
-            if record.get("kind") == "message" and isinstance(record.get("message"), dict):
-                messages.append(record["message"])
-        return messages
+            self.store = HistoryStore(Path(cfg.session_dir))
+        except (sqlite3.Error, OSError) as exc:
+            self.store = HistoryStore(None)
+            ui.warn(f"history database unavailable ({exc}); this chat will not be saved")
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self._open_session(cfg.resume)
+
+    # -- sessions ----------------------------------------------------------
+    def _open_session(self, resume) -> None:
+        """Handle --resume: latest chat, a chat number from --history, or a legacy .jsonl path."""
+        if not resume:
+            return
+        text = str(resume)
+        sid = None
+        if text == "latest":
+            rows = self.store.list_sessions(50)
+            for row in rows:
+                if self._load_session(row["id"]):
+                    return
+            if rows:
+                self.ui.warn("no chat with messages to resume; starting a new chat")
+            return
+        if text.lower().endswith(".jsonl"):
+            path = Path(text).expanduser()
+            if path.is_file():
+                sid = self.store.import_file(path)
+            else:
+                self.ui.warn(f"resume target not found: {path}; starting a new chat")
+                return
+        elif text.isdigit():
+            rows = self.store.list_sessions(1000)
+            number = int(text)
+            if not 1 <= number <= len(rows):
+                self.ui.warn(f"no chat #{number} (run --history to list chats); starting a new chat")
+                return
+            sid = rows[number - 1]["id"]
+        else:
+            self.ui.warn(f"unknown --resume target: {text}; starting a new chat")
+            return
+        if sid is None or not self._load_session(sid):
+            self.ui.warn(f"no usable messages in {text}; starting a new chat")
+
+    def _load_session(self, sid: int) -> bool:
+        """Make chat `sid` the current conversation. False if it has nothing usable."""
+        ids, loaded = self.store.load_messages(sid)
+        kept = drop_incomplete_tail(list(loaded))
+        if not kept:
+            return False
+        if len(kept) < len(loaded):
+            # Remove the interrupted tool-call tail so later turns don't append after it.
+            self.store.delete_messages(ids[len(kept):])
+        self.session_id = sid
+        self.messages = [{"role": "system", "content": self.system_prompt}] + \
+                        [m for m in kept if m.get("role") != "system"]
+        self.todo = []
+        self.repeat_key = None
+        self.repeat_count = 0
+        self.log("resumed", messages=len(kept))
+        info = self.store.get_session(sid) or {}
+        self.ui.recap(info.get("title") or "Untitled chat", kept, rel_time(info.get("updated_at")))
+        workspace = info.get("workspace")
+        if workspace and workspace != str(self.cfg.workspace):
+            self.ui.warn(f"chat started in {shorten_left(workspace, 44)}; "
+                         f"current workspace is {shorten_left(str(self.cfg.workspace), 44)}")
+        return True
+
+    def _ensure_session(self) -> int | None:
+        if self.session_id is None:
+            self.session_id = self.store.create_session(self.cfg.model, str(self.cfg.workspace))
+            if self.session_id is not None:
+                self.store.add_event(self.session_id, "start", {
+                    "model": self.cfg.model, "api": self.cfg.api, "backend": self.cfg.backend,
+                    "workspace": str(self.cfg.workspace), "threads": self.cfg.threads,
+                    "ctx": self.cfg.ctx})
+        return self.session_id
+
+    def _check_store(self) -> None:
+        if self.store.error and not self._db_warned:
+            self._db_warned = True
+            self.ui.warn(f"could not save chat history: {self.store.error}")
 
     def log(self, kind: str, **data) -> None:
-        if not self.log_fh:
+        if self.session_id is None:
             return
-        record = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, **data}
-        try:
-            self.log_fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-            self.log_fh.flush()
-        except OSError:
-            pass
+        self.store.add_event(self.session_id, kind, data)
+        self._check_store()
 
     def append(self, message: dict) -> None:
         self.messages.append(message)
-        self.log("message", message=message)
+        sid = self._ensure_session()
+        if sid is not None:
+            self.store.add_message(sid, message)
+        self._check_store()
 
     def close(self) -> None:
         self.log("end")
-        if self.log_fh:
-            self.log_fh.close()
-            self.log_fh = None
+        self.store.close()
         if self.cfg.backend == "ollama":
             try:
                 request = urllib.request.Request(
@@ -1275,16 +1344,93 @@ class Harness:
                 pass
 
     def new_session(self) -> None:
-        if self.log_fh:
-            self.log_fh.close()
-            self.log_fh = None
-        self.messages = []
+        self.session_id = None
+        self.messages = [{"role": "system", "content": self.system_prompt}]
         self.todo = []
         self.repeat_key = None
         self.repeat_count = 0
-        self._open_log(None)
-        self.messages.insert(0, {"role": "system", "content": self.system_prompt})
-        self.ui.meta(f"new session · {self.session_path.name}")
+        self.ui.meta("new chat started · /history lists earlier chats")
+
+    # -- history commands --------------------------------------------------
+    def cmd_history(self, arg: str = "") -> None:
+        arg = arg.strip().lower()
+        limit = 15
+        if arg == "all":
+            limit = 1000
+        elif arg.isdigit() and int(arg) > 0:
+            limit = int(arg)
+        rows = self.store.list_sessions(limit)
+        self._listing = [row["id"] for row in rows]
+        self.ui.history(rows, self.session_id)
+
+    def _pick(self, arg: str) -> int | None:
+        arg = arg.strip().lstrip("#")
+        if not arg.isdigit():
+            self.ui.warn("give a chat number from /history, e.g. 2")
+            return None
+        ids = self._listing or [row["id"] for row in self.store.list_sessions(15)]
+        number = int(arg)
+        if not 1 <= number <= len(ids):
+            self.ui.warn(f"no chat #{number}; run /history to see the list")
+            return None
+        return ids[number - 1]
+
+    def cmd_resume(self, arg: str = "") -> None:
+        arg = arg.strip()
+        if not arg:
+            self.cmd_history("")
+            if not self._listing:
+                return
+            try:
+                arg = input("  Open chat # (Enter cancels) › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                self.ui.out()
+                return
+            if not arg:
+                return
+        sid = self._pick(arg)
+        if sid is None:
+            return
+        if sid == self.session_id:
+            self.ui.meta("already in that chat")
+            return
+        if not self._load_session(sid):
+            self.ui.warn("that chat has no usable messages")
+
+    def cmd_delete(self, arg: str = "") -> None:
+        sid = self._pick(arg)
+        if sid is None:
+            return
+        info = self.store.get_session(sid)
+        if not info:
+            self._listing = []
+            self.ui.warn("that chat no longer exists; run /history")
+            return
+        title = ellipsize(info.get("title") or "Untitled chat", 40)
+        try:
+            answer = input("  " + self.ui.amber(f'Delete "{title}"?') + " [y/N] › ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            self.ui.out()
+            return
+        if answer not in {"y", "yes"}:
+            self.ui.meta("kept")
+            return
+        self.store.delete_session(sid)
+        self._listing = []
+        if sid == self.session_id:
+            self.new_session()
+        else:
+            self.ui.meta("deleted")
+
+    def cmd_rename(self, arg: str = "") -> None:
+        title = one_line(arg)
+        if not title:
+            self.ui.warn("usage: /rename NEW TITLE")
+        elif self.session_id is None:
+            self.ui.warn("nothing to rename yet; send a request first")
+        else:
+            self.store.rename_session(self.session_id, ellipsize(title, TITLE_MAX))
+            self.ui.meta("renamed")
 
     def refresh_ps(self) -> None:
         if self.cfg.backend != "ollama" or self._ps_shown:
@@ -1593,22 +1739,63 @@ def self_check() -> None:
 
     with tempfile.TemporaryDirectory() as temp:
         sessions = Path(temp) / "sessions"
-        sessions.mkdir()
-        empty = sessions / "a.jsonl"
-        empty.write_text(json.dumps({"kind": "start"}) + "\n", encoding="utf-8")
-        full = sessions / "b.jsonl"
-        full.write_text(json.dumps({"kind": "message",
-                                    "message": {"role": "user", "content": "hi"}}) + "\n",
-                        encoding="utf-8")
-        os.utime(empty, (time.time() + 10, time.time() + 10))  # empty log is newest
+        store = HistoryStore(sessions)
+        store.create_session("m", temp)                      # no messages: never listed
+        full_id = store.create_session("m", temp)
+        store.add_message(full_id, {"role": "user", "content": "hi\nsecond line"})
+        store.add_message(full_id, {"role": "assistant", "content": "",
+                                    "tool_calls": [{"id": "1", "name": "list_dir", "arguments": {}}]})
+        listed = store.list_sessions(10)
+        assert [row["id"] for row in listed] == [full_id] and listed[0]["title"] == "hi"
+        assert listed[0]["turns"] == 1
+        store.close()
+
         cfg = argparse.Namespace(session_dir=str(sessions), resume="latest", workspace=Path(temp),
                                  model="m", api="http://127.0.0.1:1", backend="openai",
                                  threads=0, ctx=4096, max_minutes=1, max_steps=1,
                                  max_predict=16, temperature=0.2, key="")
-        resumed = Harness(cfg, UI(color="never", stream=io.StringIO()))
-        assert resumed.session_path == full, f"resume picked {resumed.session_path}"
+        ui_out = UI(color="never", stream=io.StringIO())
+        resumed = Harness(cfg, ui_out)
+        assert resumed.session_id == full_id, f"resume picked {resumed.session_id}"
         assert [m["role"] for m in resumed.messages] == ["system", "user"]
+        assert len(resumed.store.load_messages(full_id)[1]) == 1, "interrupted tail should be removed"
+        resumed.append({"role": "assistant", "content": "ok"})
+        assert len(resumed.store.load_messages(full_id)[1]) == 2
+
+        # /new leaves the old chat saved; /history + /resume N brings it back.
+        resumed.new_session()
+        assert resumed.session_id is None and len(resumed.messages) == 1
+        assert [row["id"] for row in resumed.store.list_sessions(10)] == [full_id]
+        resumed.cmd_history("")
+        assert "RECENT CHATS" in ui_out.stream.getvalue() and "hi" in ui_out.stream.getvalue()
+        resumed.cmd_resume("1")
+        assert resumed.session_id == full_id
+        assert [m["role"] for m in resumed.messages] == ["system", "user", "assistant"]
+        resumed.cmd_rename("Renamed chat")
+        assert resumed.store.get_session(full_id)["title"] == "Renamed chat"
+        resumed.store.delete_session(full_id)
+        assert resumed.store.load_messages(full_id) == ([], []), "messages should cascade-delete"
+        assert resumed.store.list_sessions(10) == []
         resumed.close()
+
+    with tempfile.TemporaryDirectory() as temp:
+        sessions = Path(temp) / "sessions"
+        sessions.mkdir()
+        legacy = sessions / "2026-11-14T15-51-03.jsonl"
+        legacy.write_text(
+            json.dumps({"ts": "2026-11-14T15:51:03", "kind": "start", "model": "m", "workspace": "W"}) + "\n"
+            + json.dumps({"ts": "2026-11-14T15:51:49", "kind": "message",
+                          "message": {"role": "user", "content": "old request"}}) + "\n"
+            + json.dumps({"ts": "2026-11-14T15:52:00", "kind": "done", "content": "x"}) + "\n",
+            encoding="utf-8")
+        (sessions / "empty.jsonl").write_text(json.dumps({"kind": "start"}) + "\n", encoding="utf-8")
+        store = HistoryStore(sessions)
+        listed = store.list_sessions(10)
+        assert len(listed) == 1 and listed[0]["title"] == "old request" and listed[0]["workspace"] == "W"
+        store.close()
+        store = HistoryStore(sessions)  # reopening must not import twice
+        assert len(store.list_sessions(10)) == 1
+        store.close()
 
     with tempfile.TemporaryDirectory() as temp:
         sessions = Path(temp) / "sessions"
@@ -1747,9 +1934,11 @@ def main(argv=None) -> int:
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                         help="Color: auto (real terminal only), always, never. NO_COLOR is respected.")
-    parser.add_argument("--session-dir", default=str(Path(__file__).resolve().parent / "sessions"))
+    parser.add_argument("--session-dir", default=str(Path(__file__).resolve().parent / "sessions"),
+                        help=f"Folder holding the {DB_NAME} chat history (default ./sessions).")
     parser.add_argument("--resume", nargs="?", const="latest", default=None,
-                        help="Resume the latest session, or a path to a .jsonl log.")
+                        help="Resume the latest chat, a chat number from --history, or a legacy .jsonl log.")
+    parser.add_argument("--history", action="store_true", help="List recent chats and exit.")
     parser.add_argument("--doctor", action="store_true", help="Measure local model speed and GPU split, then exit.")
     parser.add_argument("--self-check", action="store_true", help="Run local sanity checks and exit.")
     args = parser.parse_args(argv)
@@ -1769,6 +1958,11 @@ def main(argv=None) -> int:
         return 2
 
     ui = UI(args.color)
+    if args.history:
+        store = HistoryStore(Path(args.session_dir))
+        ui.history(store.list_sessions(1000), hints=(("--resume N", "opens a chat"),))
+        store.close()
+        return 0
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.is_dir():
         ui.error(f"workspace is not a directory: {workspace}")
@@ -1784,7 +1978,7 @@ def main(argv=None) -> int:
         return doctor(args, ui)
 
     harness = Harness(args, ui)
-    ui.banner(args, harness.session_path)
+    ui.banner(args, harness.store.path)
 
     try:
         while True:
@@ -1795,7 +1989,8 @@ def main(argv=None) -> int:
                 break
             if not task:
                 continue
-            command = task.lower()
+            command, _, rest = task.partition(" ")
+            command = command.lower()
             if command in {"/exit", "/quit"}:
                 break
             if command == "/new":
@@ -1803,6 +1998,18 @@ def main(argv=None) -> int:
                 continue
             if command == "/help":
                 ui.help()
+                continue
+            if command in {"/history", "/chats"}:
+                harness.cmd_history(rest)
+                continue
+            if command == "/resume":
+                harness.cmd_resume(rest)
+                continue
+            if command == "/delete":
+                harness.cmd_delete(rest)
+                continue
+            if command == "/rename":
+                harness.cmd_rename(rest)
                 continue
             try:
                 harness.run_turn(task)
@@ -1819,12 +2026,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
