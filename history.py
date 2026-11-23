@@ -1,4 +1,8 @@
 """SQLite chat history for deepcode. Standard library only.
+
+One file, one database: chats, their messages, and a per-chat event log live in
+<session-dir>/history.db. deepcode.py imports HistoryStore from here; nothing in
+this module depends on deepcode.py, so it can be tested or reused on its own.
 """
 import json
 import sqlite3

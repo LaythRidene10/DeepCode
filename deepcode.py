@@ -36,7 +36,7 @@ DEFAULT_API = "http://127.0.0.1:11434"
 
 MAX_STEPS = 60
 MAX_MINUTES = 20                 # wall-clock cap per user request; 0 disables
-MODEL_TIMEOUT = 300              # socket timeout for one model call
+MODEL_TIMEOUT = 900              # seconds of silence from the model before giving up (--model-timeout)
 MAX_TOOL_CHARS = 6000            # tool output sent back to the model
 MAX_TODO_ITEMS = 12
 SHELL_TIMEOUT = 120
@@ -99,9 +99,26 @@ def desktop_path() -> Path | None:
         return None
 
 
+def general_section() -> list[str]:
+    return [
+        "",
+        "GENERAL QUESTIONS",
+        "- Not every request is about this computer. For general questions (sports, "
+        "history, science, math, definitions, advice, writing, translation), do NOT "
+        "call any tool: answer directly in a short reply.",
+        "- Never search the disk or run commands to look up general facts. You have "
+        "no internet access.",
+        "- For facts that change over time (titles, scores, prices, news), give your "
+        "best answer from memory and say it may be out of date.",
+        "- Use tools only when the request involves files, folders, code, apps, or "
+        "this computer.",
+    ]
+
+
 def build_system_prompt(cfg) -> str:
     parts = [
-        "You are deepcode, an autonomous coding agent running on Windows.",
+        "You are deepcode, an assistant running on Windows. You do coding and computer "
+        "tasks with tools, and you also answer general questions directly.",
         f"Workspace: {cfg.workspace}",
         f"Model: {cfg.model}",
         f"OS: {platform.system()} {platform.release()}",
@@ -130,6 +147,7 @@ def build_system_prompt(cfg) -> str:
         "9. Use update_todo for multi-step work and mark items done as you go.",
         "10. Answer directly when no tool is needed. Keep explanations short.",
     ]
+    parts += general_section()
     desktop = desktop_path()
     if desktop:
         parts.insert(1, f"Desktop: {desktop} (use this exact path for 'the desktop'; "
@@ -861,13 +879,14 @@ class UI:
         left = self.gray(fmt_tool(name).ljust(7)) + "  " + self.strong(ellipsize(summary, max(16, room)))
         self.out(self.row(left, duration, indent=indent))
 
-    def note(self, label: str, text: str, paint) -> None:
+    def note(self, label: str, text: str, paint, limit: int | None = 8) -> None:
         lines = self._lines(text)
+        shown = lines if limit is None else lines[:limit]
         self.out("    " + self.gray(label))
-        for line in lines[:8]:
+        for line in shown:
             self.out("    │ " + paint(line))
-        if len(lines) > 8:
-            self.out("    │ " + self.gray(f"… +{len(lines) - 8} lines"))
+        if len(shown) < len(lines):
+            self.out("    │ " + self.gray(f"… +{len(lines) - len(shown)} lines"))
 
     def thought(self, text: str) -> None:
         self.note("THINK", text, self.gray)
@@ -973,27 +992,43 @@ class UI:
             self.out()
 
     def recap(self, title: str, messages: list[dict], when: str = "") -> None:
-        bits = [f"{len(messages)} messages"]
+        """Replay a restored chat: every prompt and every agent reply, in order."""
+        turns = sum(1 for m in messages if m.get("role") == "user")
+        bits = [f"{turns} turn{'s' if turns != 1 else ''}"]
         if when:
             bits.append(when)
         right = self.gray(" · ".join(bits))
         room = max(10, self.width - 2 - 10 - visible_len(right) - 2)
         self.out()
         self.out(self.row(self.blue("↺ RESUMED") + " " + self.strong(ellipsize(title, room)), right))
-        last_user = None
-        for index in range(len(messages) - 1, -1, -1):
-            if messages[index].get("role") == "user":
-                last_user = index
-                break
-        if last_user is None:
-            return
-        self.out("  " + self.gray("YOU") + " " + self.blue("›") + " "
-                 + ellipsize(one_line(messages[last_user].get("content")), max(10, self.width - 10)))
-        for message in reversed(messages[last_user + 1:]):
-            text = str(message.get("content") or "")
-            if message.get("role") == "assistant" and text.strip() and not message.get("tool_calls"):
-                self.note("LAST REPLY", text, self.gray)
-                break
+        tools = 0
+        replied = True
+
+        def close_turn() -> None:
+            if not replied:
+                self.out("    " + self.gray("(no reply saved)"))
+
+        for message in messages:
+            role = message.get("role")
+            if role == "user":
+                close_turn()
+                lines = self._lines(message.get("content") or "")
+                self.out()
+                self.out(self.gray("YOU") + " " + self.blue("›") + " " + lines[0])
+                for line in lines[1:]:
+                    self.out("      " + line)
+                tools = 0
+                replied = False
+            elif role == "assistant":
+                tools += len(message.get("tool_calls") or [])
+                text = str(message.get("content") or "")
+                if text.strip():
+                    if tools:
+                        self.out("    " + self.gray(f"· {tools} tool call{'s' if tools != 1 else ''}"))
+                        tools = 0
+                    self.note("AGENT", text, self.strong, limit=None)
+                    replied = True
+        close_turn()
 
     def done(self, summary: str, seconds: float, steps: int, tokens: int,
              rate: float = 0.0, load: float = 0.0, gap: bool = True) -> None:
@@ -1771,6 +1806,8 @@ def self_check() -> None:
         resumed.cmd_resume("1")
         assert resumed.session_id == full_id
         assert [m["role"] for m in resumed.messages] == ["system", "user", "assistant"]
+        replay = ui_out.stream.getvalue()
+        assert "second line" in replay and "│ ok" in replay, "resume should replay prompts and replies"
         resumed.cmd_rename("Renamed chat")
         assert resumed.store.get_session(full_id)["title"] == "Renamed chat"
         resumed.store.delete_session(full_id)
@@ -1910,6 +1947,7 @@ def doctor(cfg, ui: UI) -> int:
 # Entry point
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
+    global MODEL_TIMEOUT
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -1931,6 +1969,9 @@ def main(argv=None) -> int:
                         help="Ollama context window in tokens (default 4096).")
     parser.add_argument("--max-predict", type=int, default=DEFAULT_MAX_PREDICT,
                         help="Maximum tokens generated per model call (default 1024).")
+    parser.add_argument("--model-timeout", type=int, default=MODEL_TIMEOUT,
+                        help="Seconds to wait for the model with no output before failing (default 900). "
+                             "Slow CPUs writing long files need more.")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                         help="Color: auto (real terminal only), always, never. NO_COLOR is respected.")
@@ -1953,6 +1994,10 @@ def main(argv=None) -> int:
     if args.ctx < 512 or args.ctx > 131072 or args.max_predict < 1:
         print("invalid model limits: check --ctx and --max-predict", file=sys.stderr)
         return 2
+    if args.model_timeout < 10:
+        print("--model-timeout must be at least 10 seconds", file=sys.stderr)
+        return 2
+    MODEL_TIMEOUT = args.model_timeout
     if not (0 <= args.temperature <= 2):
         print("--temperature must be between 0 and 2", file=sys.stderr)
         return 2
