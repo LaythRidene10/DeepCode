@@ -202,7 +202,7 @@ footer a{color:var(--muted)}
 
 <header class="hero">
   <div>
-    <div class="kicker">Project map · 14 November 2026</div>
+    <div class="kicker">Project map · 23 November 2026</div>
     <h1>deepcode<span class="dot">.</span></h1>
     <p class="lede">A terminal coding agent that reads code, edits files, runs commands, and checks its own work — one Python file, standard library only, no package install.</p>
     <div class="badges">
@@ -211,9 +211,10 @@ footer a{color:var(--muted)}
       <span class="badge">Ollama default</span>
       <span class="badge">OpenAI-compatible</span>
       <span class="badge">full disk</span>
+      <span class="badge">telegram</span>
     </div>
     <div class="stats">
-      <div class="stat"><b>1,830</b><span>lines · 77.6 KB</span></div>
+      <div class="stat"><b>2,346</b><span>lines · 98 KB</span></div>
       <div class="stat"><b>7</b><span>tools</span></div>
       <div class="stat"><b>0</b><span>dependencies</span></div>
     </div>
@@ -251,20 +252,21 @@ footer a{color:var(--muted)}
   <a href="#sessions">06 · Sessions</a>
   <a href="#safety">07 · Safety</a>
   <a href="#verified">08 · Verification</a>
-  <a href="#potential">09 · Potential</a>
+  <a href="#telegram">09 · Telegram</a>
+  <a href="#potential">10 · Potential</a>
 </nav>
 
 <main id="main">
 
 <section id="what">
   <div class="sec-head"><span class="sec-num">01</span><h2>What it is</h2></div>
-  <p class="lead">deepcode is a single-file, terminal-only coding harness. You type a request at <code>YOU ›</code>; it plans with tools, reads and edits real files, runs PowerShell, checks the result, and answers. It keeps a continuous conversation and writes every turn to a JSONL session log.</p>
+  <p class="lead">deepcode is a two-file, terminal-only coding harness with an optional Telegram bridge. You type a request at <code>YOU ›</code>; it plans with tools, reads and edits real files, runs PowerShell, checks the result, and answers. It keeps a continuous conversation and saves every chat to a SQLite history database.</p>
 
   <div class="grid-2">
     <div class="card">
       <span class="tag">Shape</span>
-      <h3>One file, zero installs</h3>
-      <p><code>deepcode.py</code> is 1,830 lines of Python using only the standard library. No pip, no Node, no build step, no TUI library. The UI is ANSI text.</p>
+      <h3>Two files, zero installs</h3>
+      <p><code>deepcode.py</code> is 2,073 lines and <code>history.py</code> is 273, both standard library only. No pip, no Node, no build step, no TUI library. The UI is ANSI text.</p>
     </div>
     <div class="card">
       <span class="tag">Default engine</span>
@@ -289,13 +291,16 @@ footer a{color:var(--muted)}
 
   <h3 style="margin-top:24px">Project files</h3>
   <pre>deepcode/
-├── deepcode.py      <span class="c"># the whole harness: UI, clients, tools, loop, checks</span>
-├── deepcode.bat     <span class="c"># double-click launcher for Windows</span>
-├── assets/          <span class="c"># vector logo + multi-size Windows icon</span>
-├── README.md        <span class="c"># usage, flags, performance notes, safety</span>
-├── overview.html    <span class="c"># this map (self-contained, no assets)</span>
-├── .gitignore       <span class="c"># sessions/, __pycache__/, *.pyc</span>
-└── sessions/        <span class="c"># one JSONL transcript per conversation (ignored)</span></pre>
+├── deepcode.py            <span class="c"># harness: UI, clients, tools, loop, commands, checks</span>
+├── history.py             <span class="c"># SQLite chat store; must sit next to deepcode.py</span>
+├── telegram_bot.py        <span class="c"># Telegram long-poll bridge; imports deepcode</span>
+├── deepcode.bat           <span class="c"># double-click launcher for Windows</span>
+├── deepcode-telegram.bat  <span class="c"># launcher for the Telegram bot</span>
+├── assets/                <span class="c"># vector logo + multi-size Windows icon</span>
+├── README.md              <span class="c"># usage, flags, performance notes, safety</span>
+├── overview.html          <span class="c"># this map (self-contained, no assets)</span>
+├── .gitignore             <span class="c"># sessions/, __pycache__/, *.pyc</span>
+└── sessions/              <span class="c"># history.db (ignored); legacy *.jsonl imported once</span></pre>
 </section>
 
 <section id="loop">
@@ -359,12 +364,13 @@ footer a{color:var(--muted)}
 ├── <span class="k">UI</span> · banner · prompt · spinner · diffs · todo
 ├── <span class="k">Harness</span>(cfg, ui)
 │   ├── build_system_prompt()      <span class="c"># workspace, OS, Desktop, AGENTS.md</span>
-│   ├── _open_log()                <span class="c"># sessions/*.jsonl, resume</span>
+│   ├── _open_session() · _load_session()  <span class="c"># resume latest, by number, or by path</span>
+│   ├── cmd_history · cmd_resume · cmd_delete · cmd_rename
 │   └── run_turn(task)
 │       ├── trim_history()         <span class="c"># char budget from ctx</span>
 │       ├── client.chat()          <span class="c"># Ollama stream / OpenAI JSON</span>
 │       ├── execute_tool()         <span class="c"># 7 tools, clipped observations</span>
-│       └── append() + log()       <span class="c"># history and transcript</span>
+│       └── append() + log()       <span class="c"># messages and events to history.db</span>
 ├── <span class="k">doctor</span>(cfg, ui)              <span class="c"># measure load, tok/s, GPU split</span>
 └── <span class="k">self_check</span>()                <span class="c"># no model required</span></pre>
 
@@ -379,7 +385,8 @@ footer a{color:var(--muted)}
         <tr><td><strong>Harness</strong></td><td class="mono">Harness</td><td>Owns history, todo state, repeat guard, deadline, logging, resume, and model unload on exit.</td></tr>
         <tr><td><strong>Tools</strong></td><td class="mono">TOOL_SCHEMAS, TOOL_FUNCS, execute_tool, clip</td><td>Seven functions plus their JSON schemas; centralized error handling; output clipping.</td></tr>
         <tr><td><strong>Context</strong></td><td class="mono">message_size, trim_history</td><td>Estimates characters per message; shortens large tool output; drops the oldest whole turns.</td></tr>
-        <tr><td><strong>Sessions</strong></td><td class="mono">_open_log, _read_messages, drop_incomplete_tail</td><td>Append-only JSONL; resume latest-with-messages; discards an interrupted tool-call tail.</td></tr>
+        <tr><td><strong>Sessions</strong></td><td class="mono">_open_session, _load_session, drop_incomplete_tail</td><td>SQLite chats; resume latest, by number, or by legacy path; discards an interrupted tool-call tail.</td></tr>
+        <tr><td><strong>History store</strong></td><td class="mono">history.py · HistoryStore</td><td><code>sessions/history.db</code> holds chats, messages, and events; one-time JSONL import; write errors warn once and never raise.</td></tr>
         <tr><td><strong>Diagnostics</strong></td><td class="mono">doctor, self_check</td><td>Real model speed and GPU split; offline assertions for paths, trimming, schemas, conversions, retry, UI.</td></tr>
       </tbody>
     </table>
@@ -453,7 +460,7 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
     <div class="card">
       <span class="tag">Tool output</span>
       <h3>Adaptive clipping</h3>
-      <p><code>min(6,000, max(1,500, ctx × 0.75))</code>. At the default 4k context that is 3,072 chars; at 8k it reaches the 6,000 cap. The full observation still goes to the session log.</p>
+      <p><code>min(6,000, max(1,500, ctx × 0.75))</code>. At the default 4k context that is 3,072 chars; at 8k it reaches the 6,000 cap. The full observation still goes to the events table.</p>
     </div>
     <div class="card">
       <span class="tag">Caching</span>
@@ -497,38 +504,45 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
 </section>
 
 <section id="sessions">
-  <div class="sec-head"><span class="sec-num">06</span><h2>Sessions and resume</h2></div>
-  <p class="lead">Every message, tool call, and observation is appended to a JSONL transcript. Logs are for replay and debugging — they are not backups.</p>
+  <div class="sec-head"><span class="sec-num">06</span><h2>Chats and resume</h2></div>
+  <p class="lead">Every chat lives in one SQLite database, <code>sessions/history.db</code>: the chat row, its messages, and a per-chat event log. All of it lives in <code>history.py</code>. It is for replay and debugging — not a backup.</p>
 
-  <pre><span class="c">// sessions/2026-11-14T12-05-05.jsonl (one JSON object per line)</span>
-{"kind":"start","model":"qwen3.5:4b","backend":"ollama",...}
-{"kind":"message","message":{"role":"user","content":"fix buggy.py"}}
-{"kind":"task","task":"fix buggy.py"}
-{"kind":"assistant","step":1,"content":"","tool_calls":[...]}
-{"kind":"tool","name":"read_file","args":{...},"observation":"..."}
-{"kind":"done","content":"The test passes."}
-{"kind":"end"}</pre>
+  <pre><span class="c">-- sessions/history.db (schema in history.py)</span>
+sessions   id · title · created_at · updated_at · model · workspace · source_file
+messages   id · session_id → sessions.id · ts · role · payload (JSON)
+events     id · session_id → sessions.id · ts · kind · data (JSON)
+<span class="c">-- ON DELETE CASCADE · foreign_keys = ON · indexed on (session_id, id)</span></pre>
 
   <div class="grid-2">
     <div class="card">
+      <span class="tag">When a chat exists</span>
+      <h3>Created by the first request</h3>
+      <p>A chat row is written when you send its first message, not when the app opens. Launch it and quit, and nothing is stored. The title is the first line of that first request, clipped to 70 characters.</p>
+    </div>
+    <div class="card">
       <span class="tag">Resume rules</span>
-      <h3>Latest means latest usable</h3>
-      <p><code>--resume</code> without a path scans newest-first and skips empty logs left by <code>/new</code>. An explicit path is used as given. A trailing tool result and its assistant tool-call group are dropped if the process died mid-call.</p>
+      <h3>By number, by path, or latest</h3>
+      <p><code>/resume 3</code> or <code>--resume 3</code> opens chat 3 from <code>/history</code>. Bare <code>--resume</code> takes the most recent chat. <code>--resume old.jsonl</code> still imports a legacy log. Chats with no messages are never listed.</p>
     </div>
     <div class="card">
       <span class="tag">Continuity</span>
       <h3>History is restored, prompt is refreshed</h3>
-      <p>The saved conversation is loaded, then the current system prompt replaces the old one — so workspace, date, Desktop path, and <code>AGENTS.md</code> reflect this launch. New records append to the same file.</p>
+      <p>Resuming loads the messages and replays them on screen — every prompt and reply, with a one-line tool-call count per turn. The system prompt is rebuilt, so workspace, date, Desktop path, and <code>AGENTS.md</code> match this launch. A workspace change triggers a warning.</p>
     </div>
     <div class="card">
       <span class="tag">Commands</span>
-      <h3><code>/new</code>, <code>/exit</code>, Ctrl+C</h3>
-      <p><code>/new</code> closes the log and starts a fresh session; same-second collisions get a <code>-2</code> suffix. <code>/exit</code> or <code>/quit</code> leaves. Ctrl+C aborts the current step and returns to the prompt.</p>
+      <h3><code>/history</code>, <code>/resume</code>, <code>/delete</code></h3>
+      <p><code>/history [N|all]</code> lists chats, current one marked. <code>/rename TITLE</code> retitles; <code>/delete N</code> asks y/N and cascades. <code>/new</code> starts a fresh chat and leaves the old one saved. <code>/exit</code> or <code>/quit</code> leaves; Ctrl+C aborts the current step.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Legacy logs</span>
+      <h3>Moved in once, left in place</h3>
+      <p>On first open, <code>sessions/*.jsonl</code> from the append-only era are imported as chats and recorded by filename, so a second launch does not duplicate them. The files themselves are not deleted.</p>
     </div>
     <div class="card">
       <span class="tag">Shutdown</span>
       <h3>The model is unloaded</h3>
-      <p><code>Harness.close()</code> logs the end and sends <code>keep_alive: 0</code> to Ollama. Verified: <code>/api/ps</code> reports no loaded models after exit.</p>
+      <p><code>Harness.close()</code> writes the end event, closes the database, and sends <code>keep_alive: 0</code> to Ollama. Verified: <code>/api/ps</code> reports no loaded models after exit.</p>
     </div>
   </div>
 </section>
@@ -546,12 +560,12 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
     <div class="card">
       <span class="tag">Consequence</span>
       <h3>No undo</h3>
-      <p><code>write_file</code> overwrites permanently; shell can delete anything you can delete. Session logs record what happened, but they cannot restore files.</p>
+      <p><code>write_file</code> overwrites permanently; shell can delete anything you can delete. Chat history records what happened, but it cannot restore files.</p>
     </div>
     <div class="card">
       <span class="tag">Exposure</span>
-      <h3>Logs can contain secrets</h3>
-      <p>Commands, environment-dependent output, and file contents can land in <code>sessions/*.jsonl</code>. Treat the folder as sensitive; it is git-ignored, not encrypted.</p>
+      <h3>History can contain secrets</h3>
+      <p>Commands, environment-dependent output, and file contents can land in <code>sessions/history.db</code>. Treat the folder as sensitive; it is git-ignored, not encrypted.</p>
     </div>
     <div class="card">
       <span class="tag">Edges</span>
@@ -567,24 +581,25 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
 
 <section id="verified">
   <div class="sec-head"><span class="sec-num">08</span><h2>What has been verified</h2></div>
-  <p class="lead">Claims in this page are tied to a check. “Pass” means it ran on this machine with Ollama; “unit” means assertion-only; “not run” is honest debt.</p>
+  <p class="lead">Claims in this page are tied to a check. “Pass” means it ran on this machine with Ollama; “unit” means assertion-only; “not run” is honest debt. The live runs below were measured on the pre-SQLite build; the store assertions and <code>--self-check</code> were re-run on this one.</p>
 
   <div class="tbl-wrap">
     <table>
       <thead><tr><th>Check</th><th>Status</th><th>Evidence</th></tr></thead>
       <tbody>
-        <tr><td><code>--self-check</code></td><td><span class="chip ok">pass</span></td><td>Paths and Desktop remap, trimming, schema/function match, todo validation, OpenAI/Ollama conversion, streaming merge, <code>done_reason</code>, resume skip, empty-retry fake client, colors, spinner.</td></tr>
+        <tr><td><code>--self-check</code></td><td><span class="chip ok">pass</span></td><td>Paths and Desktop remap, trimming, schema/function match, todo validation, OpenAI/Ollama conversion, streaming merge, prompt building, formatting, colors, spinner; SQLite create/list/resume/rename/delete-cascade, <code>/new</code> → <code>/history</code> → <code>/resume</code> replay, one-time JSONL import, empty-reply retry.</td></tr>
         <tr><td><code>--doctor</code></td><td><span class="chip ok">pass</span></td><td>14.9–17.0 tok/s on a 16-token probe; 3.7 GB loaded; GPU 50% / CPU 50% warning.</td></tr>
         <tr><td>Live bug fix</td><td><span class="chip ok">pass</span></td><td>Fixed <code>return a - b</code> to <code>a + b</code>, ran the test, got <code>PASS</code>. 36 s, 7 steps, 385 tokens, 13.6 tok/s.</td></tr>
         <tr><td>No-tool answer</td><td><span class="chip ok">pass</span></td><td>“Reply with exactly: READY” → <code>READY</code> in 11 s, 1 step, 29.6 tok/s.</td></tr>
         <tr><td>Desktop task</td><td><span class="chip ok">pass</span></td><td>Resolved the real Desktop, wrote <code>check.py</code>, ran it, verified <code>Hello World</code>. 19 s, 4 steps.</td></tr>
         <tr><td>Resume context</td><td><span class="chip ok">pass</span></td><td>Resumed a saved log and the model quoted the previous request exactly.</td></tr>
-        <tr><td>Resume latest</td><td><span class="chip unit">unit</span></td><td>Newest log is skipped when it has no messages; the next usable session is loaded.</td></tr>
-        <tr><td><code>/new</code> reset</td><td><span class="chip ok">pass</span></td><td>History cleared and a new JSONL file created.</td></tr>
+        <tr><td>Resume by number</td><td><span class="chip unit">unit</span></td><td>Chats with no messages never appear in the list, so an abandoned launch leaves nothing behind; <code>/resume N</code> restores the conversation and replays it.</td></tr>
+        <tr><td><code>/new</code> reset</td><td><span class="chip unit">unit</span></td><td>Conversation cleared; the previous chat stays in the database and reappears under <code>/history</code>.</td></tr>
         <tr><td>Exit unload</td><td><span class="chip ok">pass</span></td><td><code>/api/ps</code> reports no models loaded after the process exits.</td></tr>
         <tr><td>Empty-reply retry</td><td><span class="chip unit">unit</span></td><td>Fake client returns empty once, then a normal answer; asserts two calls and the final message.</td></tr>
         <tr><td>Remote OpenAI path</td><td><span class="chip unit">unit</span></td><td>Message/tool conversion asserted; no API key configured for a live call.</td></tr>
         <tr><td>Ctrl+C while streaming</td><td><span class="chip no">not run</span></td><td>Handled as a normal <code>KeyboardInterrupt</code> around the stream, but not exercised on a real TTY.</td></tr>
+        <tr><td>Telegram bridge</td><td><span class="chip unit">unit</span></td><td>Chunking under 4,096, allowlist parsing, command parsing, offset round-trip; fake-client turn, <code>/history</code>, <code>/new</code> → <code>/resume</code>, <code>/delete</code> cascade, media guard. No live token used.</td></tr>
       </tbody>
     </table>
   </div>
@@ -594,8 +609,69 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
   </div>
 </section>
 
+<section id="telegram">
+  <div class="sec-head"><span class="sec-num">09</span><h2>Telegram bridge</h2></div>
+  <p class="lead">The same harness, reachable from a phone. <code>telegram_bot.py</code> long-polls the Telegram Bot API from this PC and hands each message to <code>Harness.run_turn()</code>. Nothing on the PC is exposed to the internet.</p>
+
+  <pre>phone  →  api.telegram.org  ←──────────────  getUpdates (outbound long-poll)
+                                                      │
+                                          telegram_bot.py  →  Harness.run_turn()
+                                                      │            │
+                                          sessions/history.db  Ollama / remote API</pre>
+
+  <div class="grid-2">
+    <div class="card">
+      <span class="tag">Transport</span>
+      <h3>Outbound only</h3>
+      <p>The bot asks Telegram for new messages and holds the connection open for 25 seconds. No listening socket, no port forwarding, no public address; it works behind a router and a CGNAT.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Access</span>
+      <h3>Allowlist or nothing</h3>
+      <p>Every update is checked against <code>DEEPCODE_TG_ALLOW</code> before the queue. An unknown sender gets their own numeric id back so you can add them deliberately. The bot refuses to start with an empty list.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Shared state</span>
+      <h3>One database</h3>
+      <p>The bot imports <code>Harness</code> and writes to the same <code>sessions/history.db</code>. A chat started on the phone shows up in the PC's <code>/history</code>, and vice versa — one store, not a mirror.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Pacing</span>
+      <h3>One turn at a time</h3>
+      <p>Updates are handled sequentially: while a request runs, the next ones wait in Telegram's queue. That keeps two shell commands from mutating the same files at once.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Durability</span>
+      <h3>No replayed commands</h3>
+      <p>The update offset is persisted to <code>sessions/telegram.json</code> and saved before a task starts, so a crash or a restart never re-runs a shell command you already sent.</p>
+    </div>
+    <div class="card">
+      <span class="tag">Output</span>
+      <h3>Split at 4,096</h3>
+      <p>Answers are chunked on line boundaries under Telegram's limit; a failed or empty turn sends the reason instead of silence. Long turns acknowledge first, then keep a typing indicator alive.</p>
+    </div>
+  </div>
+
+  <h3 style="margin-top:26px">Setup</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Step</th><th class="mono">Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td>1 · Bot</td><td class="mono">@BotFather → /newbot</td><td>Creates the bot and returns a token. Treat the token as a password to this PC.</td></tr>
+        <tr><td>2 · Your id</td><td class="mono">setx DEEPCODE_TG_TOKEN "…"<br>python telegram_bot.py --whoami</td><td>Waits for your first message and prints <code>chat_id=…</code>. That id is not your phone number.</td></tr>
+        <tr><td>3 · Allow</td><td class="mono">setx DEEPCODE_TG_ALLOW "123456789"</td><td>Locks the bot to you. Without it the process exits with an error.</td></tr>
+        <tr><td>4 · Run</td><td class="mono">python telegram_bot.py --workspace C:\code\app</td><td>Or double-click <code>deepcode-telegram.bat</code>. Same flags as <code>deepcode.py</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <p><strong>Phone in hand means shell on your disk.</strong> The bot is the harness: full disk, no confirmations, no undo, running as you. Anyone using your unlocked phone can change or delete files. Keep the PC awake — sleep stops the poll — and rotate the token in BotFather if it leaks.</p>
+  </div>
+</section>
+
 <section id="potential" class="future">
-  <div class="sec-head"><span class="sec-num">09</span><h2>Potential</h2></div>
+  <div class="sec-head"><span class="sec-num">10</span><h2>Potential</h2></div>
   <p class="lead">The harness is deliberately small. The highest-leverage work from here is not more features — it is less risk, better context, and more verification. These are ordered by payoff, not novelty.</p>
 
   <div class="grid-3">
@@ -665,8 +741,8 @@ history_budget = max(1500, int((ctx - reserve) * 2.8) - tool_schema)
 </main>
 
 <footer>
-  <span>deepcode · project map · generated 14 Nov 2026</span>
-  <span><a href="README.md">README.md</a> · <a href="deepcode.py">deepcode.py</a> · self-contained page</span>
+  <span>deepcode · project map · generated 23 Nov 2026</span>
+  <span><a href="README.md">README.md</a> · <a href="deepcode.py">deepcode.py</a> · <a href="history.py">history.py</a> · self-contained page</span>
 </footer>
 </div>
 </body>

@@ -20,10 +20,20 @@ ollama pull qwen3.5:4b
 
 ```powershell
 cd C:\path\to\project
-python C:\Users\zarzi\OneDrive\Bureau\opencode\Projects\deepcode\deepcode.py
+python C:\path\to\deepcode\deepcode.py
 
 # or pick a workspace explicitly
 python deepcode.py --workspace C:\path\to\project
+```
+
+## Easy launch
+
+Double-click `deepcode.bat` to open the agent in its own folder. Flags pass
+through, and dragging a folder onto the file uses it as the workspace:
+
+```powershell
+deepcode.bat --workspace C:\path\to\project
+deepcode.bat --resume
 ```
 
 Type a request at `YOU ›`. `/new` starts a fresh chat, `/history` lists recent
@@ -182,6 +192,47 @@ calls, errors). Old `sessions/*.jsonl` logs are imported into the database
 automatically the first time it is opened; the files are left in place.
 `--resume path\to\old.jsonl` still works.
 
+## Telegram
+
+Run the agent from your phone. The bot polls Telegram outbound, so no router
+changes, port forwarding, or public IP are needed — the model and the files
+stay on this PC. Two files: `telegram_bot.py` and `deepcode-telegram.bat`.
+
+1. Create the bot: message `@BotFather` on Telegram, send `/newbot`, pick a
+   name, and copy the token (`8123456789:AAH…`). Treat it like a password.
+
+2. Find your numeric id:
+
+   ```powershell
+   setx DEEPCODE_TG_TOKEN "8123456789:AAH..."
+   python telegram_bot.py --whoami
+   ```
+
+   Send the bot any message from your phone. It prints `chat_id=… user=…` and
+   exits. That number is not your phone number.
+
+3. Lock the bot to you, then start it (a new terminal, so `setx` is visible):
+
+   ```powershell
+   setx DEEPCODE_TG_ALLOW "123456789"
+   python telegram_bot.py --workspace C:\code\myproject
+   ```
+
+   Or double-click `deepcode-telegram.bat`. Flags are the same as
+   `deepcode.py`, and `--resume` still works.
+
+From the phone, send a request like `fix the failing test in buggy.py`, or one
+of `/history [N|all]`, `/resume N`, `/new`, `/rename TITLE`, `/delete N`,
+`/status`, `/help`. One request runs at a time; a second message waits. Long
+turns answer with "working on it" first, then the result split across messages
+at Telegram's 4,096-character limit.
+
+The bot refuses to start without an allowlist. It uses the same
+`sessions/history.db` as the terminal, so chats written from the phone show up
+under `/history` on the PC and vice versa. Anything the chat can run, it runs
+on your disk as you: keep the PC awake (sleep stops the poll) and don't share
+the token.
+
 ## Flags
 
 | Flag            | Default                  | Meaning                                                                |
@@ -198,7 +249,7 @@ automatically the first time it is opened; the files are left in place.
 | `--max-predict` | 1024                     | Max generated tokens per call                                          |
 | `--temperature` | 0.2                      | Sampling temperature                                                   |
 | `--color`       | `auto`                   | `auto`, `always`, `never`                                              |
-| `--session-dir` | `./sessions`             | Folder holding `history.db`                                            |
+| `--session-dir` | folder next to `deepcode.py` | Folder holding `history.db`                                        |
 | `--resume`      | off                      | Latest chat, a chat number from `--history`, or a legacy `.jsonl` path |
 | `--history`     | off                      | List recent chats and exit                                             |
 | `--doctor`      | off                      | Measure model speed and GPU split                                      |
