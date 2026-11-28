@@ -26,7 +26,7 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
-from history import DB_NAME, TITLE_MAX, HistoryStore, rel_time
+from history import DB_NAME, TITLE_MAX, HistoryStore, parse_when, rel_time
 
 # --------------------------------------------------------------------------
 # Tunables
@@ -99,26 +99,29 @@ def desktop_path() -> Path | None:
         return None
 
 
+NO_ACCESS_REPLY = "I don't have access."
+
+
 def general_section() -> list[str]:
     return [
         "",
-        "GENERAL QUESTIONS",
-        "- Not every request is about this computer. For general questions (sports, "
-        "history, science, math, definitions, advice, writing, translation), do NOT "
-        "call any tool: answer directly in a short reply.",
-        "- Never search the disk or run commands to look up general facts. You have "
-        "no internet access.",
-        "- For facts that change over time (titles, scores, prices, news), give your "
-        "best answer from memory and say it may be out of date.",
-        "- Use tools only when the request involves files, folders, code, apps, or "
-        "this computer.",
+        "GENERAL QUESTIONS (STRICT RULE)",
+        "- You only help with code, files, folders, apps, and this computer, and you can "
+        "answer what the user asked you in earlier chats.",
+        "- For ANY general-knowledge question (countries, politics, sports, history, "
+        "science, math, definitions, advice, writing, translation, news, rankings, "
+        "opinions), do NOT answer and do NOT call any tool.",
+        f"- Your entire reply to such a question must be exactly: {NO_ACCESS_REPLY}",
+        "- Add nothing before or after it: no facts, no explanation, no apology, no "
+        "offer to help.",
     ]
 
 
 def build_system_prompt(cfg) -> str:
     parts = [
         "You are deepcode, an assistant running on Windows. You do coding and computer "
-        "tasks with tools, and you also answer general questions directly.",
+        f"tasks with tools. You do not answer general-knowledge questions: you reply "
+        f"exactly '{NO_ACCESS_REPLY}' to them.",
         f"Workspace: {cfg.workspace}",
         f"Model: {cfg.model}",
         f"OS: {platform.system()} {platform.release()}",
@@ -134,6 +137,8 @@ def build_system_prompt(cfg) -> str:
         "- list_dir, read_file, write_file, edit_file, search_files: full disk. "
         "Paths may be absolute or relative to the workspace.",
         "- update_todo: a checklist for multi-step work.",
+        "- search_history: look up what the user asked in earlier saved chats, by date or "
+        "keyword. You DO have access to earlier chats; never say you cannot recall them.",
         "",
         "HOW TO WORK",
         "1. Inspect before editing: read the file and nearby code first.",
@@ -145,7 +150,7 @@ def build_system_prompt(cfg) -> str:
         "7. Quote paths that contain spaces. Prefer absolute paths when unsure.",
         "8. Shell calls are separate processes: pass workdir or use absolute paths.",
         "9. Use update_todo for multi-step work and mark items done as you go.",
-        "10. Answer directly when no tool is needed. Keep explanations short.",
+        "10. Keep explanations short.",
     ]
     parts += general_section()
     desktop = desktop_path()
@@ -215,8 +220,35 @@ def message_size(message: dict) -> int:
     return total
 
 
+DIGEST_CHARS = 2400                 # max size of the "earlier in this chat" digest
+DIGEST_HEAD = ("EARLIER IN THIS CHAT (older messages were trimmed to fit the context window; "
+               "this is a short digest of them, oldest first):")
+
+
+def _flat(text, width: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= width else text[: width - 1].rstrip() + "…"
+
+
+def _digest_lines(dropped: list[dict]) -> list[str]:
+    """One line per dropped user turn: what was asked and the final reply."""
+    turns: list[list[str]] = []
+    for message in dropped:
+        role = message.get("role")
+        if role == "user":
+            turns.append([_flat(message.get("content"), 220), ""])
+        elif role == "assistant" and turns and not message.get("tool_calls") and message.get("content"):
+            turns[-1][1] = _flat(message.get("content"), 320)
+    return [f"- User asked: {ask}" + (f" | You replied: {reply}" if reply else "")
+            for ask, reply in turns]
+
+
 def trim_history(messages: list[dict], budget: int) -> None:
-    """Keep whole user turns and valid tool-call groups; drop the oldest first."""
+    """Keep whole user turns and valid tool-call groups; drop the oldest first.
+
+    Dropped turns are not forgotten outright: a compact digest of what the user asked
+    (and the final answer) stays at messages[1], so "what did I ask before?" still works.
+    """
     def total() -> int:
         return sum(message_size(m) for m in messages)
 
@@ -227,11 +259,22 @@ def trim_history(messages: list[dict], budget: int) -> None:
                 message["content"] = content[:800] + "\n...[trimmed]...\n" + content[-400:]
                 if total() <= budget:
                     return
-    while len(messages) > 2 and total() > budget:
-        nxt = next((i for i in range(2, len(messages)) if messages[i].get("role") == "user"), None)
+    cap = max(400, min(DIGEST_CHARS, budget // 4))
+    while True:
+        has_digest = len(messages) > 1 and bool(messages[1].get("digest"))
+        first = 2 if has_digest else 1
+        if len(messages) <= first + 1 or total() <= budget:
+            break
+        nxt = next((i for i in range(first + 1, len(messages)) if messages[i].get("role") == "user"), None)
         if nxt is None:
             break
-        del messages[1:nxt]
+        lines = str(messages[1].get("content") or "").splitlines()[1:] if has_digest else []
+        lines += _digest_lines(messages[first:nxt])
+        while lines and sum(len(l) + 1 for l in lines) > cap:
+            lines.pop(0)                                  # forget the oldest entries first
+        digest = [{"role": "system", "digest": True,
+                   "content": DIGEST_HEAD + "\n" + "\n".join(lines)}] if lines else []
+        messages[1:nxt] = digest
 
 
 def merge_ollama_event(state: dict, data: dict) -> dict:
@@ -488,6 +531,12 @@ def tool_update_todo(h, args: dict) -> str:
     return "todo updated:\n" + render_todo(cleaned)
 
 
+def tool_search_history(h, args: dict) -> str:
+    date = str(args.get("date") or "").strip()
+    keyword = str(args.get("keyword") or "").strip()
+    return h.store.history_report(date, keyword, exclude=h.session_id, max_chars=h.tool_chars)
+
+
 TOOL_FUNCS = {
     "shell": tool_shell,
     "list_dir": tool_list_dir,
@@ -496,6 +545,7 @@ TOOL_FUNCS = {
     "edit_file": tool_edit_file,
     "search_files": tool_search_files,
     "update_todo": tool_update_todo,
+    "search_history": tool_search_history,
 }
 
 
@@ -587,6 +637,14 @@ TOOL_SCHEMAS = [
                 "required": ["task", "status"],
             }},
         }, "required": ["items"]},
+    }},
+    {"type": "function", "function": {
+        "name": "search_history",
+        "description": "Look up what the user asked in earlier saved chats, by date and/or keyword. Use it whenever the user asks what they said or asked before, or on a certain day.",
+        "parameters": {"type": "object", "properties": {
+            "date": {"type": "string", "description": "A date or period in plain words, e.g. 'November 15', '2026-11-15', 'yesterday', 'last week'. Optional."},
+            "keyword": {"type": "string", "description": "Only prompts containing this word. Optional."},
+        }, "required": []},
     }},
 ]
 
@@ -1262,7 +1320,8 @@ class Harness:
         self._listing: list[int] = []        # chat ids behind the last /history numbering
         self._ps_shown = False
         self._db_warned = False
-        self.system_prompt = build_system_prompt(cfg)
+        self.base_prompt = build_system_prompt(cfg)
+        self.system_prompt = self.base_prompt
         # ~2.8 chars/token measured on code and JSON; keep room for the answer too.
         reserve = min(cfg.max_predict, 1024)
         self.history_budget = max(1500, int((cfg.ctx - reserve) * 2.8)
@@ -1273,10 +1332,20 @@ class Harness:
         except (sqlite3.Error, OSError) as exc:
             self.store = HistoryStore(None)
             ui.warn(f"history database unavailable ({exc}); this chat will not be saved")
-        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self._refresh_system()
         self._open_session(cfg.resume)
 
     # -- sessions ----------------------------------------------------------
+    def _refresh_system(self, exclude: int | None = None) -> None:
+        """Rebuild the system prompt with a digest of earlier chats (cross-chat memory)."""
+        chars = max(600, int(self.cfg.ctx * 2.8 * 0.15))
+        try:
+            recall = self.store.recall_text(chars, exclude)
+        except Exception:
+            recall = ""
+        self.system_prompt = self.base_prompt + ("\n\n" + recall if recall else "")
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+
     def _open_session(self, resume) -> None:
         """Handle --resume: latest chat, a chat number from --history, or a legacy .jsonl path."""
         if not resume:
@@ -1321,8 +1390,8 @@ class Harness:
             # Remove the interrupted tool-call tail so later turns don't append after it.
             self.store.delete_messages(ids[len(kept):])
         self.session_id = sid
-        self.messages = [{"role": "system", "content": self.system_prompt}] + \
-                        [m for m in kept if m.get("role") != "system"]
+        self._refresh_system(exclude=sid)
+        self.messages += [m for m in kept if m.get("role") != "system"]
         self.todo = []
         self.repeat_key = None
         self.repeat_count = 0
@@ -1380,7 +1449,7 @@ class Harness:
 
     def new_session(self) -> None:
         self.session_id = None
-        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self._refresh_system()
         self.todo = []
         self.repeat_key = None
         self.repeat_count = 0
@@ -1467,6 +1536,21 @@ class Harness:
             self.store.rename_session(self.session_id, ellipsize(title, TITLE_MAX))
             self.ui.meta("renamed")
 
+    HISTORY_INTENT = re.compile(
+        r"\b(remember|recall|previous|earlier|last time|last (?:chat|prompt|question|week)|"
+        r"yesterday|ask(?:ed)?|told me|i said|history|talked|discussed|did i (?:ask|say|tell))\b", re.I)
+
+    def history_note(self, task: str) -> str:
+        """If the user is asking about the past, fetch it from saved chats (small models won't dig)."""
+        if not self.HISTORY_INTENT.search(task):
+            return ""
+        try:
+            report = self.store.history_report(task, exclude=self.session_id, max_chars=1600)
+        except Exception:
+            return ""
+        return ("[Retrieved automatically from the user's saved chat history. Answer the question "
+                "from this; do not say you lack access to earlier chats.]\n" + report)
+
     def refresh_ps(self) -> None:
         if self.cfg.backend != "ollama" or self._ps_shown:
             return
@@ -1496,8 +1580,11 @@ class Harness:
             self.ui.meta(f"{threads} · ctx {self.cfg.ctx}")
 
     def run_turn(self, task: str) -> None:
+        note = self.history_note(task)           # looked up before this prompt is saved
         user_message = {"role": "user", "content": task}
         self.append(user_message)
+        if note:                                  # shown to the model only; not saved to history
+            self.messages[-1] = {"role": "user", "content": task + "\n\n" + note}
         trim_history(self.messages, self.history_budget)
         self.todo = []
         self.repeat_key = None
@@ -1688,6 +1775,8 @@ def self_check() -> None:
     trim_history(messages, 1)
     assert messages[0]["role"] == "system"
     assert messages[-1]["role"] == "assistant"
+    assert any(m.get("digest") and "User asked: a" in m["content"] for m in messages), "digest missing"
+    assert [m.get("role") for m in messages if not m.get("digest")].count("user") == 1
 
     schema_names = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
     assert schema_names == set(TOOL_FUNCS), f"schema/function mismatch: {schema_names ^ set(TOOL_FUNCS)}"
